@@ -10,7 +10,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -565,11 +565,42 @@ class Sam3VideoBase(nn.Module):
         max_frame_num_to_track = tracking_bounds.get("max_frame_num_to_track")
         start_frame_idx = tracking_bounds.get("propagate_in_video_start_frame_idx")
 
+        # Foundation VLM v2 may have encoded this frame once before entering
+        # the native detector/tracker orchestration.  Consume that exact native
+        # backbone dictionary when present; Sam3Image._get_img_feats will then
+        # skip backbone.forward_image instead of silently encoding the frame a
+        # second time.
+        precomputed_detector_backbone = None
+        feature_provenance_id = None
+        cached_entry = feature_cache.get(frame_idx)
+        if isinstance(cached_entry, tuple) and len(cached_entry) == 2:
+            cached_payload = cached_entry[1]
+            if isinstance(cached_payload, Mapping):
+                candidate = cached_payload.get("detector_backbone_out")
+                if candidate is not None:
+                    if not isinstance(candidate, Mapping):
+                        raise TypeError("detector_backbone_out cache entry must be a mapping")
+                    required = {
+                        "backbone_fpn",
+                        "vision_pos_enc",
+                        "sam2_backbone_out",
+                    }
+                    missing = required.difference(candidate)
+                    if missing:
+                        raise ValueError(
+                            "precomputed detector backbone is missing keys: "
+                            + ", ".join(sorted(missing))
+                        )
+                    precomputed_detector_backbone = dict(candidate)
+                    feature_provenance_id = cached_payload.get("feature_provenance_id")
+
+        detector_backbone_out = {"img_batch_all_stages": input_batch.img_batch}
+        if precomputed_detector_backbone is not None:
+            detector_backbone_out.update(precomputed_detector_backbone)
+        detector_backbone_out.update(text_outputs)
+
         sam3_image_out, _ = self.detector.forward_video_grounding_multigpu(
-            backbone_out={
-                "img_batch_all_stages": input_batch.img_batch,
-                **text_outputs,
-            },
+            backbone_out=detector_backbone_out,
             find_inputs=input_batch.find_inputs,
             geometric_prompt=geometric_prompt,
             frame_idx=frame_idx,
@@ -614,6 +645,10 @@ class Sam3VideoBase(nn.Module):
             "backbone_fpn": tracker_backbone_fpn,
         }
         backbone_cache["tracker_backbone_out"] = tracker_backbone_out
+        if precomputed_detector_backbone is not None:
+            backbone_cache["detector_backbone_out"] = precomputed_detector_backbone
+        if feature_provenance_id is not None:
+            backbone_cache["feature_provenance_id"] = feature_provenance_id
         feature_cache[frame_idx] = (
             input_batch.img_batch[frame_idx],
             backbone_cache,
